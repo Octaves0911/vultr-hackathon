@@ -1,0 +1,88 @@
+import Fastify from 'fastify';
+import type pg from 'pg';
+import { timingSafeEqual } from 'node:crypto';
+import { z, ZodError } from 'zod';
+import type { Health } from '@meetpilot/shared';
+import { Connector, ConnectorError } from './service.js';
+import { GithubError, GithubService } from './github.js';
+
+const Services = z.array(z.enum(['gmail', 'drive'])).min(1).max(2);
+const uuid = z.string().uuid();
+
+export function buildApp(db: pg.Pool, connector = new Connector(db), github = new GithubService(db)) {
+  const app = Fastify({ logger: process.env.NODE_ENV !== 'test', bodyLimit: 16 * 1024 * 1024 }); // internal only (shared secret); room for 10 MB of attachments as base64
+
+  // Every route except /health needs the shared secret; this service fails closed without one (docs/06).
+  app.addHook('onRequest', async (req, reply) => {
+    if (req.url === '/health') return;
+    const given = String(req.headers['x-internal-secret'] ?? ''), want = process.env.INTERNAL_SECRET ?? '';
+    if (!want || given.length !== want.length || !timingSafeEqual(Buffer.from(given), Buffer.from(want))) return reply.status(401).send({ error: { code: 'unauthorized', message: 'invalid internal secret' } });
+  });
+  app.setErrorHandler((err, _req, reply) => {
+    if (err instanceof GithubError) return reply.status(err.status).send({ error: { code: err.code, message: err.message } });
+    if (err instanceof ConnectorError) return reply.status(err.status).send({ error: { code: err.code, message: err.message } });
+    if (err instanceof ZodError) return reply.status(400).send({ error: { code: 'invalid_request', message: err.issues.map((i) => i.message).join('; ') } });
+    app.log.error({ msg: (err as Error).message }, 'request failed'); // never log tokens or request bodies
+    return reply.status(500).send({ error: { code: 'internal', message: 'internal error' } });
+  });
+
+  app.get('/health', async (): Promise<Health> => ({ service: 'connector', status: 'ok' }));
+
+  app.post('/oauth/start', async (req) => connector.start(z.object({ projectId: uuid, userId: uuid, services: Services, visibility: z.enum(['private', 'project']).default('private'), sendAccess: z.boolean().optional(), returnTo: z.string().max(200).optional() }).parse(req.body)));
+  app.post('/oauth/complete', async (req) => { const b = z.object({ code: z.string().min(1), state: z.string().min(1) }).parse(req.body); return connector.complete(b.code, b.state); });
+  app.get('/gmail/send-access', async (req) => { const q = z.object({ projectId: uuid, userId: uuid }).parse(req.query); return connector.sendAccess(q.projectId, q.userId); });
+  app.post('/gmail/send', async (req) => connector.sendMail(z.object({
+    projectId: uuid, userId: uuid, to: z.array(z.string().max(320)).max(10), cc: z.array(z.string().max(320)).max(10).optional(),
+    subject: z.string().max(1000), body: z.string().max(200_000), threadId: z.string().max(200).nullish(), inReplyTo: z.string().max(500).nullish(), references: z.string().max(2000).nullish(),
+    attachments: z.array(z.object({ filename: z.string().max(120), mime: z.string().max(100), data_b64: z.string().max(14_500_000) })).max(5).optional(),
+  }).parse(req.body)));
+  // ---- GitHub: per-project token (sealed here) and repository inspection (docs/09 §1.10)
+  const repoPart = z.string().min(1).max(100);
+  app.get('/github/status', async (req) => github.status(uuid.parse((req.query as any)?.projectId)));
+  app.put('/github/token', async (req) => { const b = z.object({ projectId: uuid, userId: uuid, token: z.string().min(20).max(255).regex(/^[A-Za-z0-9_\-]+$/) }).parse(req.body); return github.saveToken(b.projectId, b.userId, b.token); });
+  app.delete('/github/token', async (req, reply) => { await github.removeToken(uuid.parse((req.query as any)?.projectId)); return reply.status(204).send(); });
+  app.post('/github/inspect', async (req) => { const b = z.object({ projectId: uuid, owner: repoPart, name: repoPart }).parse(req.body); return github.inspect(b.projectId, b.owner, b.name); });
+  // Read-only repository access for the Code agent: the file list and single text files. Secrets are refused here regardless of what the caller asks.
+  app.get('/github/tree', async (req) => { const q = z.object({ projectId: uuid, owner: repoPart, name: repoPart, ref: z.string().min(1).max(200) }).parse(req.query); return github.tree(q.projectId, q.owner, q.name, q.ref); });
+  app.get('/github/file', async (req) => { const q = z.object({ projectId: uuid, owner: repoPart, name: repoPart, ref: z.string().min(1).max(200), path: z.string().min(1).max(300) }).parse(req.query); return github.file(q.projectId, q.owner, q.name, q.path, q.ref); });
+  /** The Code agent's verified change becomes a pull request. Called by the backend only after the reviewer's explicit confirmation. */
+  app.post('/github/pr', async (req) => {
+    const b = z.object({ projectId: uuid, owner: repoPart, name: repoPart, baseBranch: z.string().min(1).max(200), baseSha: z.string().length(40), branch: z.string().max(80), title: z.string().min(1).max(200), body: z.string().max(20_000), message: z.string().min(1).max(5_000),
+      draft: z.boolean(), files: z.array(z.object({ path: z.string().min(1).max(300), content: z.string().max(300_000), mode: z.string().max(8).optional() })).min(1).max(8) }).parse(req.body);
+    const { projectId, ...pr } = b;
+    return github.createPullRequest(projectId, pr);
+  });
+  /** For the sandbox's clone only; never exposed to a browser (the backend does not proxy it). */
+  app.get('/github/clone-token', async (req) => ({ token: await github.cloneToken(uuid.parse((req.query as any)?.projectId)) }));
+
+  app.get('/connections', async (req) => { const q = z.object({ projectId: uuid, userId: uuid }).parse(req.query); return connector.list(q.projectId, q.userId); });
+  app.put<{ Params: { id: string } }>('/connections/:id', async (req, reply) => {
+    const b = z.object({
+      userId: uuid, visibility: z.enum(['private', 'project']).optional(), confirmShare: z.boolean().optional(),
+      labels: z.array(z.string().max(200)).max(50).optional(), lookbackDays: z.number().optional(),
+      folderIds: z.array(z.string().max(200)).max(50).optional(), includeSubfolders: z.boolean().optional(),
+    }).parse(req.body);
+    const { userId, ...patch } = b;
+    await connector.update(uuid.parse(req.params.id), userId, patch);
+    return reply.status(204).send();
+  });
+  app.post<{ Params: { id: string } }>('/connections/:id/sync', async (req, reply) => {
+    const { userId } = z.object({ userId: uuid }).parse(req.body);
+    await connector.sync(uuid.parse(req.params.id), userId);
+    return reply.status(204).send();
+  });
+  app.get<{ Params: { id: string } }>('/connections/:id/gmail/labels', async (req) => connector.gmailLabels(uuid.parse(req.params.id), z.object({ userId: uuid }).parse(req.query).userId));
+  app.get<{ Params: { id: string } }>('/connections/:id/drive/folders', async (req) => {
+    const q = z.object({ userId: uuid, parent: z.string().max(200).optional() }).parse(req.query);
+    return connector.driveFolders(uuid.parse(req.params.id), q.userId, q.parent ?? 'root');
+  });
+  app.delete<{ Params: { id: string } }>('/connections/:id', async (req, reply) => {
+    await connector.disconnect(uuid.parse(req.params.id), z.object({ userId: uuid }).parse(req.query).userId);
+    return reply.status(204).send();
+  });
+  app.post<{ Params: { id: string } }>('/projects/:id/purge', async (req, reply) => { await connector.purgeProject(uuid.parse(req.params.id)); return reply.status(204).send(); });
+  app.post<{ Params: { id: string } }>('/users/:id/purge', async (req, reply) => { await connector.purgeUser(uuid.parse(req.params.id)); return reply.status(204).send(); });
+
+  app.addHook('onClose', async () => connector.stop());
+  return { app, connector };
+}

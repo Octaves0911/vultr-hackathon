@@ -1,0 +1,172 @@
+import { ArrowLeft, Ban, Bot, CheckCircle2, GitBranch, Hand, Maximize2, MessageCircleMore, Minimize2, RotateCcw, Send } from 'lucide-react';
+import { useCallback, useEffect, useState } from 'react';
+import { Link, Navigate, useParams } from 'react-router-dom';
+import { MAX_REVISIONS, type ExecutionDetail } from '@meetpilot/shared';
+import { AgentTrace, ConfidencePill, NeedsInput, RepoChoice, RunWith, StagePlan, usd } from '../components/AgentInsights';
+import { BuildWithCode, Pipeline } from '../components/Pipeline';
+import { AppShell } from '../components/AppShell';
+import { PullRequestPanel } from '../components/PullRequestPanel';
+import { ReviewChat, RevisionDiff } from '../components/ReviewChat';
+import type { LineComment } from '../components/viewers/DiffViewer';
+import { SendEmailPanel } from '../components/SendEmailPanel';
+import { ArtifactView } from '../components/viewers/ArtifactView';
+import { api, useSession } from '../lib/api';
+import { getSocket } from '../lib/socket';
+import { Avatar, EmptyState, Skeleton, toast } from '../ui';
+import { AGENT_LABEL, StatusBadge } from './Reviews';
+
+const BUSY = new Set(['routed', 'running', 'changes_requested']);
+
+export function Review() {
+  const { id } = useParams();
+  const { user } = useSession();
+  const [d, setD] = useState<ExecutionDetail | null>(null);
+  const [tab, setTab] = useState(0);
+  const [comment, setComment] = useState('');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [full, setFull] = useState(false);
+  const [lineComments, setLineComments] = useState<LineComment[]>([]);
+
+  const load = useCallback(() => api<ExecutionDetail>(`/executions/${id}`).then(setD).catch((e) => setError(e.message)), [id]);
+  useEffect(() => { if (user) void load(); }, [user, load]);
+  useEffect(() => {
+    if (!user) return;
+    const s = getSocket(user.username);
+    s.on('execution:update', load);
+    // Live trace: reload (debounced) as the agent reports each step.
+    let t: ReturnType<typeof setTimeout> | undefined;
+    const onStep = (p: { id: string }) => { if (p.id !== id) return; clearTimeout(t); t = setTimeout(load, 300); };
+    s.on('execution:step', onStep);
+    return () => { s.off('execution:update', load); s.off('execution:step', onStep); clearTimeout(t); };
+  }, [user, load, id]);
+  // Poll while an agent is working, in case a push is missed.
+  useEffect(() => {
+    if (!d || !BUSY.has(d.status)) return;
+    const t = setInterval(load, 4000);
+    return () => clearInterval(t);
+  }, [d, load]);
+  if (!user) return <Navigate to="/start" replace />;
+
+  const crumbs = <Link to="/reviews" className="row" style={{ gap: 6, color: 'var(--text-2)' }}><ArrowLeft size={16} /> Agent reviews</Link>;
+  if (!d) return <AppShell active="reviews" crumbs={crumbs}>{error ? <div className="card"><EmptyState icon={Bot} title="Review not found">{error}</EmptyState></div> : <div className="stack"><Skeleton h={34} w={300} /><Skeleton h={120} /><Skeleton h={220} /></div>}</AppShell>;
+
+  const submit = async (verdict: 'approve' | 'changes' | 'reject', choice?: 'A' | 'B') => {
+    setBusy(true); setError('');
+    try {
+      await api(`/executions/${d.id}/review`, { method: 'POST', json: { verdict, choice, comment: comment.trim() || undefined, lineComments: lineComments.length ? lineComments : undefined } });
+      toast.success(verdict === 'approve' ? 'Approved. The task is done.' : verdict === 'reject' ? 'Rejected. The task is back with a person.' : 'Sent back to the agent');
+      setComment(''); setLineComments([]); setTab(0); await load();
+    } catch (e) { setError((e as Error).message); } finally { setBusy(false); }
+  };
+  const retry = async () => { try { await api(`/executions/${d.id}/retry`, { method: 'POST' }); toast('Retrying…'); await load(); } catch (e) { toast.error((e as Error).message); } };
+
+  const arts = d.artifacts;
+  const current = arts[Math.min(tab, Math.max(arts.length - 1, 0))];
+  const revisionsLeft = MAX_REVISIONS - d.revision;
+  // Design work with two directions: approving means choosing one.
+  const directions = arts.filter((a) => a.type === 'html' && a.payload?.direction);
+
+  return (
+    <AppShell active="reviews" crumbs={crumbs}>
+      <div style={{ paddingBottom: d.canReview ? 150 : 0 }}>
+        <div className="page-head">
+          <div className="row" style={{ gap: 14, alignItems: 'flex-start' }}>
+            <span className="avatar lg" style={{ background: d.agent ? 'var(--ai)' : 'var(--text-3)', borderRadius: 14, width: 52, height: 52 }}><Bot size={24} /></span>
+            <div><div className="row" style={{ gap: 10, marginBottom: 6 }}><StatusBadge status={d.status} /><span className="faint">{d.meetingTitle}</span></div><h1 style={{ margin: 0 }}>{d.taskTitle}</h1></div>
+          </div>
+        </div>
+
+        <div className="card" style={{ marginBottom: 16 }}>
+          <dl className="kv">
+            <div><dt>Agent</dt><dd>{d.agent ? `${AGENT_LABEL[d.agent] ?? d.agent}` : '—'}</dd></div>
+            <div><dt>Assigned to</dt><dd className="row" style={{ gap: 8 }}>{d.assignee ? <><Avatar name={d.assignee.username} size="sm" />{d.assignee.username}</> : 'Unassigned'}</dd></div>
+            <div><dt>Reviewer</dt><dd className="row" style={{ gap: 8 }}>{d.reviewer ? <><Avatar name={d.reviewer.username} size="sm" />{d.reviewer.username}</> : '—'}</dd></div>
+            <div><dt>Due</dt><dd>{d.dueDate ?? '—'}</dd></div>
+            <div><dt>Revision</dt><dd>{d.revision} of {MAX_REVISIONS}</dd></div>
+            {d.repo && <div><dt>Repository</dt><dd><a href={`https://github.com/${d.repo.fullName}`} target="_blank" rel="noreferrer noopener">{d.repo.fullName}</a></dd></div>}
+            {d.confidence != null && <div><dt>Confidence</dt><dd><ConfidencePill value={d.confidence} /></dd></div>}
+            {d.usage && d.usage.calls > 0 && <div><dt>Cost</dt><dd title={`${d.usage.promptTokens + d.usage.completionTokens} tokens${d.usage.searches ? ` · ${d.usage.searches} web search${d.usage.searches > 1 ? 'es' : ''}` : ''}${d.usage.cachedTokens ? ` · ${d.usage.cachedTokens} of ${d.usage.promptTokens} prompt tokens reused from cache (${Math.round((100 * d.usage.cachedTokens) / Math.max(d.usage.promptTokens, 1))}%)` : ''} · ${d.usage.models.join(', ')}`}>{usd(d.usage.costUsd)}</dd></div>}
+          </dl>
+        </div>
+
+        {d.approvedChoice && <div className="note-inline success" role="status"><CheckCircle2 size={18} /> <span><strong>Approved direction {d.approvedChoice}.</strong> {arts.find((a) => a.payload?.direction === d.approvedChoice)?.payload?.name ?? ''}</span></div>}
+        <Pipeline d={d} />
+        {!d.pipeline?.length && <StagePlan plan={d.stagePlan} />}
+        <BuildWithCode d={d} onDone={load} />
+        <RepoChoice d={d} onDone={load} />
+        <RunWith d={d} onDone={load} />
+        {d.status === 'rejected' && <div className="note-inline info" role="status"><Ban size={18} /> <span><strong>Rejected.</strong> {d.reviews.filter((r) => r.verdict === 'reject').at(-1)?.comment ?? ''} The task is back with a person.</span></div>}
+        {d.status === 'skipped_human' && <div className="note-inline info" role="status"><Hand size={18} /> <span><strong>Left for a human.</strong> {d.routeReason}</span></div>}
+        {BUSY.has(d.status) && <div className="note-inline info" role="status"><span className="spinner" /> The {d.agent} agent is {d.status === 'changes_requested' ? 'redoing the work with your feedback' : 'working on this'}…</div>}
+        {d.status === 'failed' && <div className="card" role="alert" style={{ borderColor: 'var(--danger)' }}><strong>The agent could not finish.</strong> <span className="muted">{d.error}</span><div style={{ marginTop: 10 }}><button onClick={retry}><RotateCcw size={15} /> Retry</button></div></div>}
+
+        {d.status === 'awaiting_review' && <NeedsInput questions={d.openQuestions} />}
+        <AgentTrace steps={d.steps} busy={BUSY.has(d.status)} />
+
+        {d.summary && <div className="card" style={{ marginBottom: 16 }}><h3>Summary</h3><p style={{ marginBottom: 4 }}>{d.summary}</p>{d.notes && <p className="muted" style={{ margin: 0 }}>{d.notes}</p>}</div>}
+
+        {d.consultations.length > 0 && (
+          <details className="card" style={{ marginBottom: 16 }} open>
+            <summary style={{ cursor: 'pointer', fontWeight: 600 }}><GitBranch size={15} style={{ verticalAlign: -2, marginRight: 6 }} />Collaboration <span className="faint" style={{ fontWeight: 450 }}>· {d.consultations.length} consultation{d.consultations.length > 1 ? 's' : ''}</span></summary>
+            {d.consultations.map((c) => (
+              <div key={c.id} className="consult"><div><strong>{AGENT_LABEL[c.fromAgent] ?? c.fromAgent}</strong> asked <strong>{AGENT_LABEL[c.toAgent] ?? c.toAgent}</strong>: {c.question}</div><div className="muted" style={{ marginTop: 4 }}>→ {c.answer}</div></div>
+            ))}
+          </details>
+        )}
+
+        {arts.length > 0 && (
+          <div className={`card${full ? ' viewer-full' : ''}`} style={{ padding: 0, marginBottom: 16, overflow: 'hidden' }}>
+            <div className="row" style={{ justifyContent: 'space-between', alignItems: 'stretch' }}>
+            <div role="tablist" className="tabs" style={{ flex: 1 }}>
+              {arts.map((a, i) => <button key={a.id} role="tab" aria-selected={i === tab} className={i === tab ? 'active' : ''} onClick={() => setTab(i)}>{a.title ?? a.type}</button>)}
+            </div>
+            <button className="ghost icon" style={{ margin: 6 }} onClick={() => setFull(!full)} aria-label={full ? 'Exit full screen' : 'View full screen'} title={full ? 'Exit full screen' : 'Full screen'}>{full ? <Minimize2 size={16} /> : <Maximize2 size={16} />}</button>
+            </div>
+            <div style={{ padding: 20, ...(full ? { overflow: 'auto', flex: 1 } : {}) }}>{current && <ArtifactView artifact={current} executionId={d.id} editable={d.canReview} onSaved={load} lineComments={lineComments} onLineComments={setLineComments} />}</div>
+          </div>
+        )}
+
+        <RevisionDiff d={d} />
+
+        <SendEmailPanel d={d} onDone={load} />
+
+        {(d.agent !== 'code' || arts.some((a) => a.type === 'diff')) && <PullRequestPanel d={d} onDone={load} />}
+
+        <ReviewChat d={d} onChanged={load} />
+
+        {d.reviews.length > 0 && (
+          <div className="card" style={{ marginTop: 16 }}>
+            <h3>Review history</h3>
+            <div className="stack" style={{ gap: 10 }}>
+              {d.reviews.map((r, i) => (
+                <div key={i} className="row" style={{ gap: 10, alignItems: 'flex-start' }}>
+                  <span className="avatar sm" style={{ background: r.verdict === 'approve' ? 'var(--success)' : r.verdict === 'reject' ? 'var(--danger)' : 'var(--warn)' }}>{r.verdict === 'approve' ? <CheckCircle2 size={14} /> : r.verdict === 'reject' ? <Ban size={14} /> : <MessageCircleMore size={14} />}</span>
+                  <div><strong>{r.verdict === 'approve' ? 'Approved' : r.verdict === 'reject' ? 'Rejected' : 'Changes requested'}</strong> <span className="faint">by {r.reviewer ?? 'someone'} · revision {r.revision}</span>{r.comment && <div className="muted">“{r.comment}”</div>}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {d.canReview && (
+        <div className="review-bar" role="region" aria-label="Review">
+          <textarea rows={2} value={comment} onChange={(e) => setComment(e.target.value)} placeholder="What should change? (required to request changes or reject)" aria-label="Review comment" />
+          <div className="row" style={{ justifyContent: 'space-between', flexWrap: 'wrap' }}>
+            <span className="faint" style={{ fontSize: 13 }}>{revisionsLeft > 0 ? `${revisionsLeft} revision${revisionsLeft > 1 ? 's' : ''} left` : 'No revisions left — approve or handle this yourself.'}</span>
+            <div className="row">
+              <button disabled={busy || !comment.trim()} onClick={() => submit('reject')} title="Stop this work and hand the task back to a person. Add the reason above."><Ban size={15} /> Reject</button>
+              <button disabled={busy || (!comment.trim() && lineComments.length === 0) || revisionsLeft <= 0} onClick={() => submit('changes')}><RotateCcw size={15} /> Request changes{lineComments.length ? ` (${lineComments.length} line comment${lineComments.length > 1 ? 's' : ''})` : ''}</button>
+              {directions.length >= 2
+                ? directions.map((a) => <button key={a.id} className="primary" disabled={busy} onClick={() => submit('approve', a.payload!.direction)} title={`Approve direction ${a.payload!.direction}: ${a.payload!.name ?? ''}`}><Send size={15} /> Approve {a.payload!.direction}</button>)
+                : <button className="primary" disabled={busy} onClick={() => submit('approve')}><Send size={15} /> Approve</button>}
+            </div>
+          </div>
+          {error && <p className="error" role="alert" style={{ margin: 0 }}>{error}</p>}
+        </div>
+      )}
+      {!d.canReview && error && <p className="error" role="alert">{error}</p>}
+    </AppShell>
+  );
+}
