@@ -2,6 +2,8 @@
 
 A video meeting app with a quiet, real-time AI assistant that remembers your projects. It shows live captions, spots decisions, tasks and conflicts with earlier meetings, answers `@ai` questions from project memory, and after the meeting hands doable tasks to specialist AI agents whose work you review.
 
+**Live demo:** https://45.32.189.118.sslip.io (runs on a Vultr Cloud Compute instance, LLM calls via Vultr Serverless Inference). Sign in with a username such as `priya`, start a meeting in "Launch Q3" and turn on AI Assistance. Login is username-only, so use made-up data.
+
 - Product requirements: [PRD.md](PRD.md)
 - Design: [docs/TECHNICAL_SPEC.md](docs/TECHNICAL_SPEC.md) (architecture, data model, API, AI pipeline, UX, security, build plan, operations)
 
